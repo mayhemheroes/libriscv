@@ -14,28 +14,30 @@ namespace riscv
 	template <int W>
 	template <typename Type>
 	inline void CPU<W>::amo(format_t instr,
-		void(*op)(CPU&, register_type<W>&, uint32_t))
+		Type(*op)(CPU&, Type&, uint32_t))
 	{
 		// 1. load address from rs1
 		const auto addr = this->reg(instr.Atype.rs1);
-		// 2. read value from writable memory location
-		auto& mem = machine().memory.template writable_read<Type> (addr);
-		// 4. apply <op>
-		register_type<W> value = mem;
-		op(*this, value, instr.Atype.rs2);
-		// 3. place value into rd
+		// 2. verify address alignment vs Type
+		if (UNLIKELY(addr % sizeof(Type) != 0)) {
+			trigger_exception(INVALID_ALIGNMENT, addr);
+		}
+		// 3. read value from writable memory location
+		Type& mem = machine().memory.template writable_read<Type> (addr);
+		// 4. apply <op> (writing the value to mem)
+		// and returning the old value
+		Type old_value = op(*this, mem, instr.Atype.rs2);
+		// 5. place value into rd
 		// NOTE: we have to do it in this order, because we can
 		// clobber rs2 when writing to rd, if they are the same!
 		if (instr.Atype.rd != 0) {
 			if constexpr (sizeof(Type) == 4)
-				this->reg(instr.Atype.rd) = (int32_t) mem;
+				this->reg(instr.Atype.rd) = (int32_t) old_value;
 			else if constexpr (sizeof(Type) == 8)
-				this->reg(instr.Atype.rd) = (int64_t) mem;
+				this->reg(instr.Atype.rd) = (int64_t) old_value;
 			else
-				this->reg(instr.Atype.rd) = mem;
+				this->reg(instr.Atype.rd) = old_value;
 		}
-		// 5. write value back to [rs1]
-		mem = value;
 	}
 
 	ATOMIC_INSTR(AMOADD_W,
@@ -43,7 +45,7 @@ namespace riscv
 	{
 		cpu.template amo<uint32_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value += cpu.reg(rs2);
+			return __sync_fetch_and_add(&value, cpu.reg(rs2));
 		});
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) -> int {
@@ -60,7 +62,7 @@ namespace riscv
 	{
 		cpu.template amo<uint32_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value ^= cpu.reg(rs2);
+			return __sync_fetch_and_xor(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -70,7 +72,7 @@ namespace riscv
 	{
 		cpu.template amo<uint32_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value |= cpu.reg(rs2);
+			return __sync_fetch_and_or(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -80,7 +82,7 @@ namespace riscv
 	{
 		cpu.template amo<uint32_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value &= cpu.reg(rs2);
+			return __sync_fetch_and_and(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -90,7 +92,7 @@ namespace riscv
 	{
 		cpu.template amo<uint64_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value += cpu.reg(rs2);
+			return __sync_fetch_and_add(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -100,7 +102,7 @@ namespace riscv
 	{
 		cpu.template amo<uint64_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value ^= cpu.reg(rs2);
+			return __sync_fetch_and_xor(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -110,7 +112,7 @@ namespace riscv
 	{
 		cpu.template amo<uint64_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value |= cpu.reg(rs2);
+			return __sync_fetch_and_or(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -120,7 +122,7 @@ namespace riscv
 	{
 		cpu.template amo<uint64_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			value &= cpu.reg(rs2);
+			return __sync_fetch_and_and(&value, cpu.reg(rs2));
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -130,7 +132,9 @@ namespace riscv
 	{
 		cpu.template amo<__uint128_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
+			auto old_value = value;
 			value += cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -140,7 +144,9 @@ namespace riscv
 	{
 		cpu.template amo<__uint128_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
+			auto old_value = value;
 			value ^= cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -150,7 +156,9 @@ namespace riscv
 	{
 		cpu.template amo<__uint128_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
+			auto old_value = value;
 			value |= cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -160,7 +168,9 @@ namespace riscv
 	{
 		cpu.template amo<__uint128_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
+			auto old_value = value;
 			value &= cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	DECODED_ATOMIC(AMOADD_W).printer);
@@ -170,11 +180,9 @@ namespace riscv
 	{
 		cpu.template amo<uint32_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			if (rs2 != 0) {
-				value = cpu.reg(rs2);
-			} else {
-				value = 0;
-			}
+			auto old_value = value;
+			value = cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	[] (char* buffer, size_t len, auto&, rv32i_instruction instr) -> int {
@@ -190,11 +198,9 @@ namespace riscv
 	{
 		cpu.template amo<uint64_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			if (rs2 != 0) {
-				value = cpu.reg(rs2);
-			} else {
-				value = 0;
-			}
+			auto old_value = value;
+			value = cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	DECODED_ATOMIC(AMOSWAP_W).printer);
@@ -204,11 +210,9 @@ namespace riscv
 	{
 		cpu.template amo<__uint128_t>(instr,
 		[] (auto& cpu, auto& value, auto rs2) {
-			if (rs2 != 0) {
-				value = cpu.reg(rs2);
-			} else {
-				value = 0;
-			}
+			auto old_value = value;
+			value = cpu.reg(rs2);
+			return old_value;
 		});
 	},
 	DECODED_ATOMIC(AMOSWAP_W).printer);
