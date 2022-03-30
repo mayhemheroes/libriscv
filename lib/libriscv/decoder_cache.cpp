@@ -17,21 +17,29 @@ using qc_unordered_set = std::unordered_set<T>;
 
 namespace riscv
 {
-	static const qc_unordered_set<uint8_t> fsim_jumpy_insn
-	{
-		RV32I_BRANCH,
-		RV32I_JALR,
-		RV32I_JAL,
-		RV32I_SYSTEM,
-	};
 	[[maybe_unused]] static constexpr size_t QC_TRESHOLD = 8;
 	[[maybe_unused]] static constexpr size_t QC_MAX = 0xFFFF;
-	[[maybe_unused]] static constexpr size_t FS_MAXI = 4096;
+	[[maybe_unused]] static constexpr size_t FS_MAXI = 16384;
 
 	template <int W>
 	static bool fastsim_gucci_opcode(rv32i_instruction instr) {
-		if (instr.is_long())
-			return fsim_jumpy_insn.count(instr.opcode()) == 0;
+		if (instr.is_long()) {
+			// Instructions that stop the machine:
+			if (instr.opcode() == RV32I_SYSTEM) {
+				// EBREAK, STOP and WFI
+				if (instr.Itype.imm > 0x0)
+					return false;
+				// Regular system call and CSRs
+				return false;
+			}
+			if (instr.opcode() == RV32I_JAL)
+			{
+				// We like short offsets: 64 instructions back, 32 forward
+				return (instr.Jtype.jump_offset() >= -256 && instr.Jtype.jump_offset() < 0);
+			}
+			// Direct jumps are unpredictable
+			return instr.opcode() != RV32I_JALR;
+		}
 		const rv32c_instruction ci { instr };
 		#define CI_CODE(x, y) ((x << 13) | (y))
 		switch (ci.opcode()) {

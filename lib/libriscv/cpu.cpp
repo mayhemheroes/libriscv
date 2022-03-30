@@ -270,6 +270,7 @@ namespace riscv
 			}
 			// Execute instruction using handler and 32-bit wrapper
 			idata->handler(cpu, instruction);
+			if (UNLIKELY(cpu.registers().pc != pc)) break;
 			// increment *local* PC
 			if constexpr (compressed_enabled)
 				pc += instruction.length();
