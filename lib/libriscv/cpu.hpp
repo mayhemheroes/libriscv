@@ -23,6 +23,7 @@ namespace riscv
 		using instruction_t = Instruction<W>;
 
 		void simulate(uint64_t);
+		void simulate_precise(uint64_t); // Never fuses instructions
 		void step_one();
 		void reset();
 		void reset_stack_pointer() noexcept;
@@ -101,8 +102,10 @@ namespace riscv
 		address_t m_exec_begin = 0;
 		address_t m_exec_end   = 0;
 
+#ifndef RISCV_INBOUND_JUMPS_ONLY
 		// Page cache for execution on virtual memory
 		mutable CachedPage<W, const Page> m_cache;
+#endif
 
 		const unsigned m_cpuid;
 

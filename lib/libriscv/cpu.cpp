@@ -49,8 +49,10 @@ namespace riscv
 			// This function will (at most) validate the execute segment
 			this->jump(initial_pc);
 		}
+#ifndef RISCV_INBOUND_JUMPS_ONLY
 		// reset the page cache
 		this->m_cache = {};
+#endif
 	}
 
 	template <int W>
@@ -62,6 +64,7 @@ namespace riscv
 	#endif
 	}
 
+#ifndef RISCV_INBOUND_JUMPS_ONLY
 	template <int W> __attribute__((noinline))
 	typename CPU<W>::format_t CPU<W>::read_next_instruction_slowpath() const
 	{
@@ -114,6 +117,7 @@ namespace riscv
 
 		return instruction;
 	}
+#endif // RISCV_INBOUND_JUMPS_ONLY
 
 	template <int W>
 	typename CPU<W>::format_t CPU<W>::read_next_instruction() const
@@ -122,16 +126,15 @@ namespace riscv
 			return format_t { *(uint32_t*) &m_exec_data[this->pc()] };
 		}
 
-#ifdef RISCV_FLAT_MEMORY
+#if defined(RISCV_FLAT_MEMORY) || defined(RISCV_INBOUND_JUMPS_ONLY)
 		trigger_exception(EXECUTION_SPACE_PROTECTION_FAULT, this->pc());
 #else
 		return read_next_instruction_slowpath();
 #endif
 	}
 
-#ifndef RISCV_FAST_SIMULATOR
 	template<int W> __attribute__((hot, no_sanitize("undefined")))
-	void CPU<W>::simulate(uint64_t max)
+	void CPU<W>::simulate_precise(uint64_t max)
 	{
 #ifdef RISCV_INSTR_CACHE
 		auto* exec_decoder = machine().memory.get_decoder_cache();
@@ -213,7 +216,14 @@ namespace riscv
 				registers().pc += 4;
 		} // while not stopped
 
-	} // CPU::simulate
+	} // CPU::simulate_precise
+
+#ifndef RISCV_FAST_SIMULATOR
+	template<int W> __attribute__((hot))
+	void CPU<W>::simulate(uint64_t imax)
+	{
+		simulate_precise(imax);
+	}
 
 #else // RISCV_FAST_SIMULATOR
 
@@ -234,11 +244,15 @@ namespace riscv
 			// The number of instructions to run until we can check
 			// if we ran out of instructions or PC changed.
 			size_t count = decoder->idxend;
+			if constexpr (VERBOSE_FASTSIM) {
+				printf("Fastsim at PC=0x%lX count=%zu\n", (long)pc, count);
+			}
 			machine().increment_counter(count);
 			auto* decoder_end = &decoder[count];
+			unsigned length = 0;
 			// We want to run 4 instructions at a time, except for
 			// the last one, which we will "always" do next
-			while (decoder+4 < decoder_end)
+			while (decoder+4 < decoder_end && !compressed_enabled)
 			{
 				registers().pc = pc + 0;
 				decoder[0].handler(*this, format_t {decoder[0].instr});
@@ -265,14 +279,20 @@ namespace riscv
 				decoder->handler(*this, instruction);
 				// increment *local* PC
 				if constexpr (compressed_enabled) {
-					pc += instruction.length();
-					decoder += instruction.length() / 2;
+					length = instruction.length();
+					pc += length;
+					decoder += length / 2;
 				} else {
 					pc += 4;
 					decoder++;
 				}
 			} while (decoder < decoder_end);
-			pc = registers().pc + 4;
+			// The loop above ended because PC could have changed.
+			// Update to real PC by reading from register memory.
+			if constexpr (compressed_enabled)
+				pc = registers().pc + length;
+			else
+				pc = registers().pc + 4;
 
 		} while (!machine().stopped());
 		registers().pc = pc;
@@ -286,7 +306,7 @@ namespace riscv
 		// the max instructions that we had before. If the machine is stopped
 		// the old count is not preserved.
 		auto old_maxi = machine().max_instructions();
-		this->simulate(1);
+		this->simulate_precise(1);
 		if (machine().max_instructions() != 0)
 			machine().set_max_instructions(old_maxi);
 	}

@@ -37,12 +37,23 @@ void syscall_exit(Machine<W>& machine)
 	machine.stop();
 }
 ```
-Our exit system call handler extracts the exit status code from the first argument to the system call, stops the machine and then returns a mandatory value. The return value in this system call is not important, as the machine has already been stopped and isn't expecting to return from the system call it just ran.
+Our exit system call handler extracts the exit status code from the first argument to the system call, prints it to stdout and then stops the machine. Installing the system call handler in a machine is straight-forward:
+
+```C++
+machine.install_syscall_handler(93, syscall_exit<RISCV64>);
+machine.install_syscall_handler(94, machine.syscall_handlers.at(93));
+```
+Here we installed a 64-bit system call handler for both `exit` (93) and `exit_group` (94).
+
+```C++
+Machine<RISCV64>::install_syscall_handler(93, syscall_exit<RISCV64>);
+```
+System call handlers are static by design to avoid system call setup overhead when creating machines.
 
 Stopping the machine in practice just means exiting the `Machine::simulate()` loop.
 
 Be careful about modifying registers during system calls, as it may cause problems
-in the simulated program. The program may only be expecting you to modify register A0.
+in the simulated program. The program may only be expecting you to modify register A0 (return value) or modifying memory pointed to by a system call argument.
 
 ## Handling an advanced system call
 
@@ -72,17 +83,35 @@ Here we extract 3 arguments, `int fd, void* buffer, size_t len`, looks familiar?
 
 The return value of a call into a kernel is usually a success or error indication, and the way to set an error is to negate a POSIX error code. Success is often 0, however in this case the return value is the bytes written. To make sure we pass on errno properly, we use the helper function `machine.set_result_or_error()`. It takes care of handling the common error case for us.
 
-## Installing system calls
+## Zero-copy write
 
-To be able to handle system calls, they need to be installed into the machine:
+`write` can be implemented in a zero-copy manner:
 
+```C++
+#include <unistd.h>
+
+template <int W>
+void syscall_write(Machine<W>& machine)
+{
+	const auto [fd, address, len] =
+		machine.template sysargs <int, address_type<W>, address_type<W>> ();
+	// We only accept standard output pipes, for now :)
+	if (fd == 1 || fd == 2) {
+		// Zero-copy retrieval of page-sized buffers (64kb)
+		riscv::vBuffer buffers[16];
+		size_t cnt =
+			machine.memory.gather_buffers_from_range(16, buffers, address, len);
+		// We could use writev here, but we will just print it instead
+		for (size_t i = 0; i < cnt; i++) {
+			machine.print(buffers[i].ptr, buffers[i].len);
+		}
+		machine.set_result(len);
+		return;
+	}
+	machine.set_result(-EBADF);
+}
 ```
-const int SYS_WRITE = 64;
-machine.install_syscall_handler(SYS_WRITE, syscall_write<W>);
-```
-Now when the VM guest calls `printf()` and the C library uses the `write` syscall, our `syscall_write` function will be called.
-
-This method of installing your own system call handlers effectively means you can curate an API for your particular needs.
+`gather_buffers_from_range` will fill an iovec-like array of structs up until the given number of buffers. We can then use that array to print or forward the data without copying anything.
 
 ## Communicating the other way
 
