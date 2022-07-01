@@ -2,4 +2,4 @@ project: libriscv
 target: vmfuzzer32
 
 cmds:
-  - cmd: /vmfuzzer32 -fork=1 -handle_fpe=0
+  - cmd: /vmfuzzer32 -handle_fpe=0
