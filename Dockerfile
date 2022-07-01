@@ -1,33 +1,24 @@
-FROM ubuntu:latest
+FROM --platform=linux/amd64 ubuntu:20.04 as builder
 
-RUN apt update && apt install -y \
-	cmake git \
-	clang-18 \
-	g++-13-riscv64-linux-gnu
+## Install build dependencies.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y cmake clang && \
+    apt-get install -y lld
 
-ENV CXX=clang++-18
+## Add source code to the build stage.
+COPY fuzz/ ./fuzz
+COPY lib/ ./lib
+WORKDIR /fuzz
 
-COPY lib /app/lib
-COPY emulator/build.sh /app/emulator/build.sh
-COPY emulator/CMakeLists.txt /app/emulator/CMakeLists.txt
-COPY emulator/src /app/emulator/src
-COPY binaries/measure_mips/fib.c /app/emulator/fib.c
 
-# Fast emulation (with TCC JIT compilation)
-WORKDIR /app/emulator
-RUN ./build.sh -x --tcc && cp .build/rvlinux /app/rvlinux
+## TODO: ADD YOUR BUILD INSTRUCTIONS HERE.
+RUN ./fuzzer.sh
 
-# Fastest emulator (with binary translation)
-WORKDIR /app/emulator
-RUN ./build.sh -x --bintr && cp .build/rvlinux /app/rvlinux-fast
+## TODO: Change <Path in Builder Stage>
+FROM --platform=linux/amd64 ubuntu:20.04
 
-# Clean up
-RUN rm -rf /app/emulator/.build
-
-# Example program
-WORKDIR /app
-RUN riscv64-linux-gnu-gcc-13 -march=rv32g -mabi=ilp32d -static -O2 -nostdlib -ffreestanding emulator/fib.c -o fib
-
-# Provdide a path to your cli apps executable
-WORKDIR /app
-ENTRYPOINT [ "./rvlinux" ]
+COPY --from=builder /fuzz/build/vmfuzzer32 /
+#RUN apt-get update && \
+#    DEBIAN_FRONTEND=noninteractive apt-get install -y cmake clang && \
+#    apt-get install -y lld 
+CMD ./vmfuzzer32 -fork=1 -handle_fpe=0

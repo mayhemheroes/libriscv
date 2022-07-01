@@ -1,0 +1,5 @@
+project: libriscv 
+target: vmfuzzer32
+
+cmds:
+  - cmd: /vmfuzzer32 -handle_fpe=0
