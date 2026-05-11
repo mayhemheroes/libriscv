@@ -29,6 +29,44 @@ static void my_exit(RISCVMachine *m)
 }
 
 static void make_vm_function_call(RISCVMachine *m, const char *function);
+static void test_fast_fork(RISCVMachine *master);
+
+static void create_and_initialize_machine(const char *elf_buf, size_t size, const RISCVOptions *options, RISCVMachine **machine_out)
+{
+	/* RISC-V machine */
+	RISCVMachine *m = libriscv_new(elf_buf, size, options);
+	if (!m) {
+		fprintf(stderr, "Failed to initialize the RISC-V machine!\n");
+		exit(1);
+	}
+
+	/* A custom exit system call handler. WARNING: POSIX threads will not work right! */
+	libriscv_set_syscall_handler(93, my_exit);
+
+	/* Add some allowed files that covers most dynamic executables. */
+	static const char *libs[] = {
+		"libdl.so.2",
+		"libm.so.6",
+		"libgcc_s.so.1",
+		"libc.so.6",
+		"libatomic.so.1",
+		"libstdc++.so.6",
+		"libresolv.so.2",
+		"libnss_dns.so.2",
+		"libnss_files.so.2"
+	};
+	for (unsigned i = 0; i < sizeof(libs)/sizeof(libs[0]); i++)
+		libriscv_allow_file(m, libs[i]);
+
+	/* RISC-V execution, timing out after 5bn instructions */
+	const int res = libriscv_run(m, 5000000000ull);
+	if (res < 0) {
+		fprintf(stderr, "Error during execution: %s\n", libriscv_strerror(res));
+		exit(1);
+	}
+
+	*machine_out = m;
+}
 
 int main(int argc, char **argv)
 {
@@ -57,41 +95,11 @@ int main(int argc, char **argv)
 	options.stdout = stdout_callback;
 	options.opaque = NULL;
 	options.strict_sandbox = 0;
-
-	/* RISC-V machine */
-	RISCVMachine *m = libriscv_new(buffer, size, &options);
-	if (!m) {
-		fprintf(stderr, "Failed to initialize the RISC-V machine!\n");
-		exit(1);
-	}
-
-	/* A custom exit system call handler. WARNING: POSIX threads will not work right! */
-	libriscv_set_syscall_handler(93, my_exit);
-
-	/* Add some allowed files that covers most dynamic executables. */
-	static const char *libs[] = {
-		"libdl.so.2",
-		"libm.so.6",
-		"libgcc_s.so.1",
-		"libc.so.6",
-		"libatomic.so.1",
-		"libstdc++.so.6",
-		"libresolv.so.2",
-		"libnss_dns.so.2",
-		"libnss_files.so.2"
-	};
-	for (unsigned i = 0; i < sizeof(libs)/sizeof(libs[0]); i++)
-		libriscv_allow_file(m, libs[i]);
+	options.native_syscall_base = 470;
 
 	struct timespec start_time = time_now();
-
-	/* RISC-V execution, timing out after 5bn instructions */
-	const int res = libriscv_run(m, 5000000000ull);
-	if (res < 0) {
-		fprintf(stderr, "Error during execution: %s\n", libriscv_strerror(res));
-		exit(1);
-	}
-
+	RISCVMachine *m = NULL;
+	create_and_initialize_machine(buffer, size, &options, &m);
 	struct timespec end_time = time_now();
 
 	const int64_t retval = libriscv_return_value(m);
@@ -110,6 +118,13 @@ int main(int argc, char **argv)
 	make_vm_function_call(m, "test");
 
 	libriscv_delete(m);
+
+	/* Test the new fast-fork API, with native heap syscalls enabled */
+	RISCVMachine *m2 = NULL;
+	create_and_initialize_machine(buffer, size, &options, &m2);
+	test_fast_fork(m2);
+
+	libriscv_delete(m2);
 }
 
 /**
@@ -147,12 +162,105 @@ void make_vm_function_call(RISCVMachine *m, const char *function)
 		/* Begin execution, with max 1bn instruction count. */
 		libriscv_run(m, 1000000000ull);
 
+		//*libriscv_max_counter_pointer(m) = 1000000000ull;
+		//while (1) {
+		//	int64_t step_res = libriscv_step_one(m, 1, 1);
+		//	if (step_res < 0) {
+		//		printf("*** VM call error: %s\n", libriscv_strerror((int)step_res));
+		//		return;
+		//	} else if (step_res == 0) {
+		//		printf("*** VM call stopped (machine halted or instruction limit reached)\n");
+		//		break;
+		//	}
+		//}
+
 		printf("*** VM function call return value: %ld\n",
 			libriscv_return_value(m));
 	} else {
 		fprintf(stderr,
 			"Could not jump to function at 0x%lX\n", (long)vaddr);
 	}
+}
+
+/**
+ * Test the high-level fast-fork API.
+ **/
+void test_fast_fork(RISCVMachine *master)
+{
+	printf("\n=== Testing C fast-fork API ===\n");
+
+	/* Verify master state */
+	printf("Master is_forked: %d (expected 0)\n", libriscv_is_forked(master));
+	printf("Master heap_address: 0x%lX\n", (long)libriscv_heap_address(master));
+	printf("Master stack_initial: 0x%lX\n", (long)libriscv_stack_initial(master));
+	printf("Master owned_pages: %" PRIu64 "\n", libriscv_owned_pages_active(master));
+
+	/* Create fork options (reusing RISCVOptions for simplicity) */
+	RISCVOptions opts;
+	libriscv_set_defaults(&opts);
+	opts.error = error_callback;
+	opts.stdout = stdout_callback;
+
+	/* Time the fork creation */
+	struct timespec t0 = time_now();
+
+	RISCVMachine *fork = libriscv_fast_fork(master, &opts);
+	if (!fork) {
+		fprintf(stderr, "Failed to create fast fork!\n");
+		return;
+	}
+
+	struct timespec t1 = time_now();
+	printf("Fork created in %" PRId64 " ns\n", nanodiff(t0, t1));
+	printf("Fork is_forked: %d (expected 1)\n", libriscv_is_forked(fork));
+
+	/* Try to call a function in the fork */
+	const uint64_t vaddr = libriscv_address_of(master, "test");
+	if (vaddr != 0x0) {
+		if (libriscv_setup_vmcall(fork, vaddr) == 0) {
+			RISCVRegisters *regs = libriscv_get_registers(fork);
+			LIBRISCV_ARG_REGISTER(regs, 0) = 999;
+			static const char msg[] = "Hello from fork!";
+			uint64_t strva = libriscv_stack_push(fork, regs, msg, sizeof(msg));
+			LIBRISCV_ARG_REGISTER(regs, 1) = strva;
+			int fres = libriscv_run(fork, 1000000000ull);
+			printf("Fork run result: %d (%s)\n", fres, libriscv_strerror(fres));
+			printf("Fork function call return value: %ld\n",
+				libriscv_return_value(fork));
+		}
+	} else {
+		printf("No 'test' symbol found, skipping fork function call\n");
+	}
+
+	/* Clean up fork */
+	libriscv_delete(fork);
+	printf("Fork deleted successfully\n");
+
+	const uint64_t bench_vaddr = libriscv_address_of(master, "do_nothing");
+	if (bench_vaddr != 0x0) {
+		/* Time fork-call-destruct x 1000 */
+		struct timespec t0 = time_now();
+
+		for (int i = 0; i < 1000; i++) {
+			RISCVMachine *fork = libriscv_fast_fork(master, &opts);
+			if (!fork) {
+				fprintf(stderr, "Failed to create fast fork!\n");
+				return;
+			}
+			if (libriscv_setup_vmcall(fork, bench_vaddr) == 0) {
+				libriscv_run(fork, 100000000ull);
+			}
+			libriscv_delete(fork);
+		}
+
+		struct timespec t1 = time_now();
+		printf("Fork-call-destruct x 1000 took %" PRId64 " ns. You can serve requests in %.2f micros/req\n",
+			nanodiff(t0, t1), nanodiff(t0, t1) / 1e6); // 1000 reqs * 1e3 micros/ns
+	} else {
+		printf("No 'do_nothing' symbol found, skipping fork function call\n");
+	}
+
+	printf("=== Fast-fork test complete ===\n\n");
 }
 
 struct timespec time_now()
