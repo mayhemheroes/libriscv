@@ -6,8 +6,8 @@
 #include "common.hpp"
 #include <cstddef>
 #include <cassert>
-#include <deque>
 #include <unordered_map>
+#include <vector>
 #include "util/function.hpp"
 
 namespace riscv
@@ -17,22 +17,17 @@ struct Arena;
 struct ArenaChunk
 {
 	using PointerType = uint32_t;
+	static constexpr uint32_t NO_CHUNK = UINT32_MAX;
 
 	ArenaChunk() = default;
-	ArenaChunk(ArenaChunk* n, ArenaChunk* p, size_t s, bool f, PointerType d)
+	ArenaChunk(uint32_t n, uint32_t p, size_t s, bool f, PointerType d)
 		: next(n), prev(p), size(s), free(f), data(d) {}
 
-	ArenaChunk* next = nullptr;
-	ArenaChunk* prev = nullptr;
+	uint32_t next = NO_CHUNK;
+	uint32_t prev = NO_CHUNK;
 	size_t size = 0;
 	bool   free = false;
 	PointerType data = 0;
-
-	ArenaChunk* find_used(PointerType ptr) const;
-	ArenaChunk* find_free(size_t size);
-	void merge_next(Arena&);
-	void split_next(Arena&, size_t size);
-	void subsume_next(Arena&, size_t extra);
 };
 
 struct Arena
@@ -44,430 +39,404 @@ struct Arena
 	using unknown_free_func_t = Function<int(PointerType, ArenaChunk *)>;
 
 	/// @brief Construct an arena that manages allocations for a given memory range.
-	/// @param base The base address of the memory range.
-	/// @param end  The end address of the memory range.
+	/// @param base The base (lowest) guest address owned by this arena.
+	/// @param end  One-past-the-end guest address; the initial free chunk spans [base, end).
+	/// @note The slab vector is pre-allocated to @p m_max_chunks entries at construction time.
 	Arena(PointerType base, PointerType end);
 
-	/// @brief Transfer allocations from another arena.
-	/// @param other The arena to transfer allocations from.
-	/// @note The other arena is left unchanged, allowing for multiple transfers.
+	/// @brief Copy-construct by transferring all allocations from @p other.
+	/// @param other Source arena; it is left unchanged so multiple destinations can be seeded.
+	/// @note Equivalent to calling `other.transfer(*this)`.
 	Arena(const Arena& other);
 
-	/// @brief Allocate memory from the arena.
-	/// @param size The size of the allocation.
-	/// @return Address to the allocated memory range, or 0 if allocation failed.
-	/// @note The memory range is not guaranteed to be zeroed. 8-byte alignment is guaranteed.
-	PointerType malloc(size_t size);
+	/// @brief Allocate a region of guest memory.
+	/// @param size Requested allocation size in bytes (rounded up to 16-byte alignment).
+	/// @return Guest address of the allocated region, or 0 on failure.
+	/// @note The returned memory is not zeroed. Lookup for subsequent free/realloc is O(1).
+	PointerType   malloc(size_t size);
 
-	/// @brief Reallocate memory from the arena.
-	/// @param ptr The allocation to resize.
-	/// @param newsize The new size of the allocation.
-	/// @return Pointer to the reallocated memory range, or 0 if reallocation failed.
-	/// @note Memory is not moved here, only the allocation itself. An implementor
-	/// should copy the data from the old pointer to the new pointer if necessary.
+	/// @brief Resize an existing allocation.
+	/// @param old     Guest address previously returned by malloc() or seq_alloc_aligned().
+	///                Passing 0 behaves like malloc(@p size).
+	/// @param size    New desired size in bytes.
+	/// @return {new_ptr, bytes_to_copy}: if new_ptr == old_ptr the block was grown in-place
+	///         and no copy is needed (bytes_to_copy == 0); otherwise the caller must copy
+	///         @p bytes_to_copy bytes from the old address to new_ptr, then the old block is freed.
+	///         Returns {0, 0} if the reallocation failed.
+	/// @note If @p old is not found in this arena the registered on_unknown_realloc() callback
+	///       is invoked (used by the fast-fork path to delegate to the parent arena).
 	ReallocResult realloc(PointerType old, size_t size);
 
-	/// @brief Get the size of an allocation.
-	/// @param src The pointer to the memory range.
-	/// @param allow_free Whether to allow querying the size of a free chunk.
-	/// @return The size of the memory range, or 0 if the pointer is invalid.
-	size_t      size(PointerType src, bool allow_free = false) const;
+	/// @brief Query the allocated size of a guest pointer.
+	/// @param src        Guest address to look up.
+	/// @param allow_free If true, report the size even for free chunks (useful for debugging).
+	/// @return The chunk size in bytes, or 0 if @p src is not a live allocation.
+	size_t        size(PointerType src, bool allow_free = false) const;
 
 	/// @brief Free a previous allocation.
-	/// @param src The pointer to the memory range.
-	/// @return 0 if the memory range was successfully freed, or -1 if the pointer is invalid.
-	signed int  free(PointerType);
+	/// @param ptr Guest address to free.
+	/// @return 0 on success, -1 if @p ptr is not found in this arena.
+	/// @note Adjacent free chunks are coalesced immediately. If @p ptr is not found the
+	///       registered on_unknown_free() callback is invoked.
+	signed int    free(PointerType);
 
-	/// @brief Attempt to allocate a fully sequential memory range,
-	/// unless the arena is flat, in which case all memory is sequential.
-	/// Alignment is currently ignored, but 8-byte alignment is guaranteed.
-	/// @param size The size of the memory range to allocate.
-	/// @param alignment The alignment of the returned address.
-	/// @param arena_is_flat Whether the arena is flat. A configuration option.
-	/// @return Pointer to the allocated memory range, or 0 if allocation failed.
-	/// @note The memory range is not guaranteed to be zeroed.
-	/// @note If an excessive amount of chunks are allocated, an exception is thrown.
+	/// @brief Allocate a region that does not straddle a page boundary.
+	/// @param size          Requested size in bytes.
+	/// @param alignment     Desired alignment (currently unused; 16-byte alignment is always applied).
+	/// @param arena_is_flat When true (flat arena mode) this delegates straight to malloc().
+	///                      When false the allocator skips candidates that cross a page boundary,
+	///                      splitting the chunk at the boundary as needed.
+	/// @return Guest address of the allocated region, or 0 on failure.
+	/// @throws MachineException if @p size exceeds RISCV_PAGE_SIZE or if the chunk limit is hit.
 	PointerType seq_alloc_aligned(size_t size, size_t alignment, bool arena_is_flat = riscv::flat_readwrite_arena);
 
+	/// @brief Total bytes currently held in free chunks.
 	size_t bytes_free() const;
-	size_t bytes_used() const;
-	size_t chunks_used() const noexcept { return m_chunks.size(); }
 
-	/// @brief Compute the highest address covered by any live (non-free) allocation.
-	/// Call once after master VM initialization and cache the result; each fork
-	/// uses the cached value to create a fresh arena starting at the watermark,
-	/// so no chunk-list copy is needed at fork time.
+	/// @brief Total bytes currently held in live (non-free) chunks.
+	size_t bytes_used() const;
+
+	/// @brief Number of slab slots consumed (live + recycled-but-not-yet-reused).
+	size_t chunks_used() const noexcept { return m_slab_top; }
+
+	/// @brief Highest guest address covered by any live (non-free) allocation.
+	/// @details Call once after the master VM is fully initialised and cache the result.
+	///          Each fork uses the cached watermark as the base of its fresh arena so that
+	///          no chunk-list copy is needed at fork time.  Runs in O(n) over all chunks.
 	PointerType high_watermark() const {
-		PointerType hwm = m_base_chunk.data;
-		const ArenaChunk* ch = &m_base_chunk;
-		while (ch != nullptr) {
-			if (!ch->free)
-				hwm = std::max(hwm, ch->data + (PointerType)ch->size);
-			ch = ch->next;
+		PointerType hwm = slab(0).data;
+		uint32_t idx = 0;
+		while (idx != ArenaChunk::NO_CHUNK) {
+			const auto& ch = m_chunk_slab[idx];
+			if (!ch.free)
+				hwm = std::max(hwm, ch.data + (PointerType)ch.size);
+			idx = ch.next;
 		}
 		return hwm;
 	}
 
+	/// @brief Override the maximum number of slab slots (default: 4000).
+	/// @param new_max New cap; must be set before the first allocation.
 	void set_max_chunks(unsigned new_max) { this->m_max_chunks = new_max; }
 
-	unsigned allocation_counter() const noexcept { return m_allocation_counter; }
+	/// @brief Total number of successful malloc() / seq_alloc_aligned() calls since construction.
+	unsigned allocation_counter()   const noexcept { return m_allocation_counter; }
+
+	/// @brief Total number of successful free() calls since construction.
 	unsigned deallocation_counter() const noexcept { return m_deallocation_counter; }
 
+	/// @brief Deep-copy all arena state into @p dest, overwriting it.
+	/// @param dest Destination arena; any prior state is replaced.
+	/// @note The source arena is unchanged; used by the copy constructor and the fast-fork path.
 	void transfer(Arena& dest) const;
 
+	/// @brief Register a fallback for free() on pointers not owned by this arena.
+	/// @param func Callable receiving the unknown pointer and a (possibly null) ArenaChunk hint;
+	///             must return 0 on success or -1 on failure.
+	/// @note Used by the fast-fork path so forks can delegate pre-fork allocations to the parent.
 	void on_unknown_free(unknown_free_func_t func) {
 		m_free_unknown_chunk = std::move(func);
 	}
+
+	/// @brief Register a fallback for realloc() on pointers not owned by this arena.
+	/// @param func Callable receiving the unknown pointer and the new size;
+	///             must return a ReallocResult (same semantics as realloc()).
+	/// @note Used by the fast-fork path so forks can delegate pre-fork allocations to the parent.
 	void on_unknown_realloc(unknown_realloc_func_t func) {
 		m_realloc_unknown_chunk = std::move(func);
 	}
 
 	/** Internal usage **/
-	inline ArenaChunk& base_chunk() {
-		return m_base_chunk;
-	}
-	inline const ArenaChunk& base_chunk() const {
-		return m_base_chunk;
-	}
-	template <typename... Args>
-	ArenaChunk* new_chunk(Args&&... args);
-	void   free_chunk(ArenaChunk*);
-	ArenaChunk* find_chunk(PointerType ptr);
+	ArenaChunk&       base_chunk()       { return m_chunk_slab[0]; }
+	const ArenaChunk& base_chunk() const { return m_chunk_slab[0]; }
+
+	ArenaChunk&       slab(uint32_t idx)       { return m_chunk_slab[idx]; }
+	const ArenaChunk& slab(uint32_t idx) const { return m_chunk_slab[idx]; }
+
+	uint32_t new_chunk(uint32_t next, uint32_t prev, size_t sz, bool f, PointerType d);
+	void     free_chunk(uint32_t idx);
 
 	static size_t word_align(size_t size) {
 		return (size + (ALIGNMENT-1)) & ~(ALIGNMENT-1);
 	}
 	static size_t fixup_size(size_t size) {
-		// The minimum allocation is 8 bytes
 		return std::max(ALIGNMENT, word_align(size));
 	}
-private:
-	void internal_free(ArenaChunk* ch);
-	void foreach(Function<void(const ArenaChunk&)>) const;
-	ArenaChunk* begin_find_used(PointerType ptr) const;
 
-	std::deque<ArenaChunk> m_chunks;
-	std::vector<ArenaChunk*> m_free_chunks;
-#ifdef ENABLE_ARENA_CHUNK_MAP
-	std::unordered_map<PointerType, ArenaChunk*> m_used_chunk_map;
-#endif
-	ArenaChunk  m_base_chunk;
-	unsigned    m_max_chunks = 4'000u;
-	unsigned    m_allocation_counter = 0u;
-	unsigned    m_deallocation_counter = 0u;
+private:
+	uint32_t begin_find_used(PointerType ptr) const;
+	uint32_t find_free(size_t size) const;
+
+	void internal_free(uint32_t idx);
+	void merge_next(uint32_t idx);
+	void split_next(uint32_t idx, size_t size);
+	void subsume_next(uint32_t idx, size_t newlen);
+
+	std::vector<ArenaChunk> m_chunk_slab;
+	uint32_t m_slab_top  = 0;
+	uint32_t m_slab_free = ArenaChunk::NO_CHUNK;
+
+	std::unordered_map<PointerType, uint32_t> m_used_chunk_map;
+
+	unsigned m_max_chunks = 4'000u;
+	unsigned m_allocation_counter   = 0u;
+	unsigned m_deallocation_counter = 0u;
 
 	unknown_free_func_t m_free_unknown_chunk
 		= [] (auto, auto*) { return -1; };
 	unknown_realloc_func_t m_realloc_unknown_chunk
 		= [] (auto, auto) { return ReallocResult{0, 0}; };
-	friend struct ArenaChunk;
 };
 
-inline ArenaChunk* Arena::begin_find_used(PointerType ptr) const
+// ---------------------------------------------------------------------------
+// Slab management
+// ---------------------------------------------------------------------------
+
+inline uint32_t Arena::new_chunk(uint32_t next, uint32_t prev, size_t sz, bool f, PointerType d)
 {
-#ifdef ENABLE_ARENA_CHUNK_MAP
+	uint32_t idx;
+	if (m_slab_free != ArenaChunk::NO_CHUNK) {
+		idx = m_slab_free;
+		m_slab_free = m_chunk_slab[idx].next;
+	} else {
+		if (UNLIKELY(m_slab_top >= m_max_chunks))
+			throw MachineException(INVALID_PROGRAM, "Too many arena chunks", m_max_chunks);
+		idx = m_slab_top++;
+	}
+	m_chunk_slab[idx] = ArenaChunk{next, prev, sz, f, d};
+	return idx;
+}
+
+inline void Arena::free_chunk(uint32_t idx)
+{
+	m_chunk_slab[idx].next = m_slab_free;
+	m_slab_free = idx;
+}
+
+// ---------------------------------------------------------------------------
+// Lookup
+// ---------------------------------------------------------------------------
+
+inline uint32_t Arena::begin_find_used(PointerType ptr) const
+{
 	auto it = m_used_chunk_map.find(ptr);
 	if (it != m_used_chunk_map.end())
 		return it->second;
-	return nullptr;
-#else
-	return base_chunk().find_used(ptr);
-#endif
+	return ArenaChunk::NO_CHUNK;
 }
 
-// find exact free chunk that matches ptr
-inline ArenaChunk* ArenaChunk::find_used(PointerType ptr) const
+inline uint32_t Arena::find_free(size_t size) const
 {
-	const ArenaChunk* ch = this;
-	while (ch != nullptr) {
-		if (!ch->free && ch->data == ptr)
-			return const_cast<ArenaChunk*>(ch);
-		ch = ch->next;
+	uint32_t idx = 0; // always start from slot 0 (head of linked list)
+	while (idx != ArenaChunk::NO_CHUNK) {
+		const auto& ch = m_chunk_slab[idx];
+		if (ch.free && ch.size >= size)
+			return idx;
+		idx = ch.next;
 	}
-	return nullptr;
-}
-// find free chunk that has at least given size
-inline ArenaChunk* ArenaChunk::find_free(size_t size)
-{
-    ArenaChunk* ch = this;
-	while (ch != nullptr) {
-		if (ch->free && ch->size >= size)
-			return ch;
-		ch = ch->next;
-	}
-	return nullptr;
-}
-// merge this and next into this chunk
-inline void ArenaChunk::merge_next(Arena& arena)
-{
-	ArenaChunk* freech = this->next;
-	this->size += freech->size;
-	this->next = freech->next;
-	if (this->next) {
-		this->next->prev = this;
-	}
-	arena.free_chunk(freech);
+	return ArenaChunk::NO_CHUNK;
 }
 
-inline void ArenaChunk::subsume_next(Arena& arena, size_t newlen)
-{
-	assert(this->size < newlen);
-	ArenaChunk* ch = this->next;
-	assert(ch);
+// ---------------------------------------------------------------------------
+// Chunk operations
+// ---------------------------------------------------------------------------
 
-	if (this->size + ch->size < newlen)
+inline void Arena::merge_next(uint32_t idx)
+{
+	auto& ch  = slab(idx);
+	uint32_t nidx = ch.next;
+	auto& nch = slab(nidx);
+	ch.size  += nch.size;
+	ch.next   = nch.next;
+	if (ch.next != ArenaChunk::NO_CHUNK)
+		slab(ch.next).prev = idx;
+	free_chunk(nidx);
+}
+
+inline void Arena::split_next(uint32_t idx, size_t size)
+{
+	auto& ch = slab(idx);
+	if (ch.size > size) {
+		uint32_t newIdx = new_chunk(
+			ch.next, idx,
+			ch.size - size, true,
+			ch.data + (PointerType)size);
+		if (ch.next != ArenaChunk::NO_CHUNK)
+			slab(ch.next).prev = newIdx;
+		ch.next = newIdx;
+	}
+	// Exact fit: neighbors already point correctly to idx; no surgery needed.
+	slab(idx).size = size;
+}
+
+inline void Arena::subsume_next(uint32_t idx, size_t newlen)
+{
+	auto& ch  = slab(idx);
+	assert(ch.size < newlen);
+	uint32_t nidx = ch.next;
+	assert(nidx != ArenaChunk::NO_CHUNK);
+	auto& nch = slab(nidx);
+
+	if (ch.size + nch.size < newlen)
 		return;
 
-	const size_t subsume = newlen - this->size;
-	ch->size -= subsume;
-	ch->data += subsume;
-	this->size = newlen;
+	const size_t subsume = newlen - ch.size;
+	nch.size -= subsume;
+	nch.data += (PointerType)subsume;
+	ch.size   = newlen;
 
-	// Free the next chunk if we ate all of it
-	if (ch->size == 0) {
-		this->next = ch->next;
-		if (this->next) {
-			this->next->prev = this;
-		}
-		arena.free_chunk(ch);
+	if (nch.size == 0) {
+		ch.next = nch.next;
+		if (ch.next != ArenaChunk::NO_CHUNK)
+			slab(ch.next).prev = idx;
+		free_chunk(nidx);
 	}
 }
 
-inline void ArenaChunk::split_next(Arena& arena, size_t size)
-{
-	// Only split if the new chunk would not be empty
-	if (this->size > size)
-	{
-		ArenaChunk* newch = arena.new_chunk(
-			this->next,
-			this,
-			this->size - size,
-			true, // free
-			this->data + (PointerType) size
-		);
-		if (this->next) {
-			this->next->prev = newch;
-		}
-		this->next = newch;
-	} else {
-		// If the new chunk would be empty, connect distant chunks instead
-		if (this->prev && this->next && this->prev->free && this->next->free) {
-			this->prev->next = this->next;
-			this->next->prev = this->prev;
-		} else if (this->prev && this->prev->free) {
-			this->prev->next = nullptr;
-		} else if (this->next && this->next->free) {
-			this->next->prev = nullptr;
-		}
-	}
-	this->size = size;
-}
-
-template <typename... Args>
-inline ArenaChunk* Arena::new_chunk(Args&&... args)
-{
-	if (UNLIKELY(m_free_chunks.empty())) {
-		if (m_chunks.size() >= this->m_max_chunks)
-			throw MachineException(INVALID_PROGRAM, "Too many arena chunks", this->m_max_chunks);
-
-		m_chunks.emplace_back(std::forward<Args>(args)...);
-		return &m_chunks.back();
-	}
-	auto* chunk = m_free_chunks.back();
-	m_free_chunks.pop_back();
-	return new (chunk) ArenaChunk {std::forward<Args>(args)...};
-}
-inline void Arena::free_chunk(ArenaChunk* chunk)
-{
-	m_free_chunks.push_back(chunk);
-}
-inline ArenaChunk* Arena::find_chunk(PointerType ptr)
-{
-	for (auto& chunk : m_chunks) {
-		if (!chunk.free && chunk.data == ptr)
-			return &chunk;
-	}
-	return nullptr;
-}
-
-inline void Arena::internal_free(ArenaChunk* ch)
+inline void Arena::internal_free(uint32_t idx)
 {
 	this->m_deallocation_counter++;
-#ifdef ENABLE_ARENA_CHUNK_MAP
-	this->m_used_chunk_map.erase(ch->data);
-#endif
-	ch->free = true;
-	// merge chunks ahead and behind us
-	if (ch->next && ch->next->free) {
-		ch->merge_next(*this);
-	}
-	if (ch->prev && ch->prev->free) {
-		ch = ch->prev;
-		ch->merge_next(*this);
+	auto& ch = slab(idx);
+	m_used_chunk_map.erase(ch.data);
+	ch.free = true;
+
+	if (ch.next != ArenaChunk::NO_CHUNK && slab(ch.next).free)
+		merge_next(idx);
+	if (ch.prev != ArenaChunk::NO_CHUNK && slab(ch.prev).free) {
+		uint32_t pidx = slab(idx).prev;
+		merge_next(pidx);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Public allocator operations
+// ---------------------------------------------------------------------------
 
 inline Arena::PointerType Arena::malloc(size_t size)
 {
 	const size_t length = fixup_size(size);
-	ArenaChunk* ch = base_chunk().find_free(length);
+	uint32_t idx = find_free(length);
 	this->m_allocation_counter++;
 
-	if (ch != nullptr) {
-		ch->split_next(*this, length);
-		ch->free = false;
-
-#ifdef ENABLE_ARENA_CHUNK_MAP
-		this->m_used_chunk_map.insert_or_assign(ch->data, ch);
-#endif
-		return ch->data;
+	if (idx != ArenaChunk::NO_CHUNK) {
+		split_next(idx, length);
+		auto& ch = slab(idx);
+		ch.free = false;
+		m_used_chunk_map.insert_or_assign(ch.data, idx);
+		return ch.data;
 	}
 	return 0;
 }
 
-// Guarantee that allocation is sequential in memory
-// when accessed outside of emulation. A single page
-// has fully sequential memory within itself, so we can
-// always allocate sequential memory within a single page.
 inline Arena::PointerType Arena::seq_alloc_aligned(size_t size, size_t alignment, bool arena_is_flat)
 {
 	(void)alignment;
 
-	if (arena_is_flat) {
+	if (arena_is_flat)
 		return malloc(size);
-	}
 
-	// XXX: Alignment is ignored for now,
-	// but 16-byte alignment is guaranteed.
 	const size_t objectsize = fixup_size(size);
 	this->m_allocation_counter++;
 	if (objectsize > RISCV_PAGE_SIZE)
 		throw MachineException(INVALID_PROGRAM, "Requested sequential allocation too large", objectsize);
 
-	ArenaChunk* ch = &base_chunk();
-restart_seq_alloc_search:
-	// Find memory that can always cover the object sequentially
-	ch = ch->find_free(objectsize);
+	uint32_t idx = 0;
+restart:
+	while (idx != ArenaChunk::NO_CHUNK) {
+		const auto& ch = m_chunk_slab[idx];
+		if (ch.free && ch.size >= objectsize) break;
+		idx = ch.next;
+	}
 
-	if (ch != nullptr) {
-		// Check if data + size is on the same page
-		if ((ch->data & ~(RISCV_PAGE_SIZE-1)) !=
-			((ch->data + objectsize - 1) & ~(RISCV_PAGE_SIZE-1)))
+	if (idx != ArenaChunk::NO_CHUNK) {
+		auto& ch = slab(idx);
+		if ((ch.data & ~(RISCV_PAGE_SIZE-1)) !=
+			((ch.data + objectsize - 1) & ~(RISCV_PAGE_SIZE-1)))
 		{
-			// The next page boundary
-			const PointerType boundary = (ch->data + objectsize - 1) & ~(RISCV_PAGE_SIZE-1);
-			if (boundary < ch->data)
+			const PointerType boundary = (ch.data + objectsize - 1) & ~(RISCV_PAGE_SIZE-1);
+			if (boundary < ch.data)
 				throw MachineException(INVALID_PROGRAM, "Page boundary overflow", boundary);
-			// Figure out the size until the boundary
-			const size_t remaining = boundary - ch->data;
-			// If the chunks new size would be too small, find a new chunk instead
-			if (ch->size - remaining < objectsize) {
-				if (ch->next == nullptr) {
-					// We ran out of arena space
-					return 0;
-				}
-				ch = ch->next;
-				goto restart_seq_alloc_search;
+			const size_t remaining = boundary - ch.data;
+			if (ch.size - remaining < objectsize) {
+				if (ch.next == ArenaChunk::NO_CHUNK) return 0;
+				idx = ch.next;
+				goto restart;
 			}
-			// Split at the page boundary
-			ch->split_next(*this, remaining);
-			ch = ch->next;
+			split_next(idx, remaining);
+			idx = slab(idx).next;
 		}
 
-		ch->split_next(*this, objectsize);
-		ch->free = false;
-#ifdef ENABLE_ARENA_CHUNK_MAP
-		this->m_used_chunk_map.insert_or_assign(ch->data, ch);
-#endif
-		return ch->data;
+		split_next(idx, objectsize);
+		auto& ch2 = slab(idx);
+		ch2.free = false;
+		m_used_chunk_map.insert_or_assign(ch2.data, idx);
+		return ch2.data;
 	}
 	return 0;
 }
 
-inline Arena::ReallocResult
-	Arena::realloc(PointerType ptr, size_t newsize)
+inline Arena::ReallocResult Arena::realloc(PointerType ptr, size_t newsize)
 {
-	if (ptr == 0x0) // Regular malloc
+	if (ptr == 0x0)
 		return {malloc(newsize), 0};
 
-	ArenaChunk* ch = this->begin_find_used(ptr);
-	if (UNLIKELY(ch == nullptr || ch->free)) {
-		// Realloc failure handler
+	uint32_t idx = this->begin_find_used(ptr);
+	if (UNLIKELY(idx == ArenaChunk::NO_CHUNK))
 		return m_realloc_unknown_chunk(ptr, newsize);
-	}
 
 	newsize = fixup_size(newsize);
-	if (ch->size >= newsize) // Already long enough?
-		return {ch->data, 0};
+	if (slab(idx).size >= newsize)
+		return {slab(idx).data, 0};
 
-	// We return the old length to aid memcpy
-	const size_t old_len = ch->size;
-	// Try to eat from the next chunk
-	if (ch->next && ch->next->free) {
-		ch->subsume_next(*this, newsize);
-		if (ch->size >= newsize)
-			return {ch->data, 0};
+	const size_t old_len = slab(idx).size;
+
+	if (slab(idx).next != ArenaChunk::NO_CHUNK && slab(slab(idx).next).free) {
+		subsume_next(idx, newsize);
+		if (slab(idx).size >= newsize)
+			return {slab(idx).data, 0};
 	}
 
-	// Fallback to malloc, then free the old chunk
-	ptr = malloc(newsize);
-	if (ptr != 0x0) {
-		this->internal_free(ch);
-		return {ptr, old_len};
+	PointerType newptr = malloc(newsize);
+	if (newptr != 0x0) {
+		internal_free(idx);
+		return {newptr, old_len};
 	}
-
 	return {0x0, 0x0};
 }
 
 inline size_t Arena::size(PointerType ptr, bool allow_free) const
 {
-	ArenaChunk* ch = this->begin_find_used(ptr);
-	if (UNLIKELY(ch == nullptr || (ch->free && !allow_free)))
+	uint32_t idx = this->begin_find_used(ptr);
+	if (UNLIKELY(idx == ArenaChunk::NO_CHUNK))
 		return 0;
-	return ch->size;
+	const auto& ch = slab(idx);
+	if (ch.free && !allow_free)
+		return 0;
+	return ch.size;
 }
 
 inline int Arena::free(PointerType ptr)
 {
-	ArenaChunk* ch = this->begin_find_used(ptr);
-	if (UNLIKELY(ch == nullptr || ch->free))
-		return m_free_unknown_chunk(ptr, ch);
+	uint32_t idx = this->begin_find_used(ptr);
+	if (UNLIKELY(idx == ArenaChunk::NO_CHUNK))
+		return m_free_unknown_chunk(ptr, nullptr);
+	if (UNLIKELY(slab(idx).free))
+		return m_free_unknown_chunk(ptr, &slab(idx));
 
-	this->internal_free(ch);
+	this->internal_free(idx);
 	return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Construction / transfer
+// ---------------------------------------------------------------------------
+
 inline Arena::Arena(PointerType arena_base, PointerType arena_end)
 {
-	m_base_chunk.size = arena_end - arena_base;
-	m_base_chunk.data = arena_base;
-	m_base_chunk.free = true;
-}
-
-inline void Arena::foreach(Function<void(const ArenaChunk&)> callback) const
-{
-	const ArenaChunk* ch = &this->m_base_chunk;
-    while (ch != nullptr) {
-		callback(*ch);
-		ch = ch->next;
-	}
-}
-
-inline size_t Arena::bytes_free() const
-{
-	size_t size = 0;
-	foreach([&size] (const ArenaChunk& chunk) {
-		if (chunk.free) size += chunk.size;
-	});
-	return size;
-}
-inline size_t Arena::bytes_used() const
-{
-	size_t size = 0;
-	foreach([&size] (const ArenaChunk& chunk) {
-		if (!chunk.free) size += chunk.size;
-	});
-	return size;
+	m_chunk_slab.resize(m_max_chunks);
+	m_chunk_slab[0] = ArenaChunk{ArenaChunk::NO_CHUNK, ArenaChunk::NO_CHUNK,
+	                              (size_t)(arena_end - arena_base), true, arena_base};
+	m_slab_top = 1;
 }
 
 inline Arena::Arena(const Arena& other)
@@ -477,28 +446,37 @@ inline Arena::Arena(const Arena& other)
 
 inline void Arena::transfer(Arena& dest) const
 {
-	dest.m_base_chunk = m_base_chunk;
-	dest.m_chunks.clear();
-	dest.m_free_chunks.clear();
-	dest.m_max_chunks = m_max_chunks;
-	dest.m_allocation_counter = m_allocation_counter;
+	dest.m_chunk_slab         = m_chunk_slab;
+	dest.m_slab_top           = m_slab_top;
+	dest.m_slab_free          = m_slab_free;
+	dest.m_used_chunk_map     = m_used_chunk_map;
+	dest.m_max_chunks         = m_max_chunks;
+	dest.m_allocation_counter   = m_allocation_counter;
 	dest.m_deallocation_counter = m_deallocation_counter;
+}
 
-	ArenaChunk* last = &dest.m_base_chunk;
-
-	const ArenaChunk* chunk = m_base_chunk.next;
-	while (chunk != nullptr)
-	{
-		dest.m_chunks.push_back(*chunk);
-		auto& new_chunk = dest.m_chunks.back();
-		new_chunk.prev = last;
-		new_chunk.next = nullptr;
-		last->next = &new_chunk;
-		/* New last before next iteration */
-		last = &new_chunk;
-
-		chunk = chunk->next;
+inline size_t Arena::bytes_free() const
+{
+	size_t total = 0;
+	uint32_t idx = 0;
+	while (idx != ArenaChunk::NO_CHUNK) {
+		const auto& ch = m_chunk_slab[idx];
+		if (ch.free) total += ch.size;
+		idx = ch.next;
 	}
+	return total;
+}
+
+inline size_t Arena::bytes_used() const
+{
+	size_t total = 0;
+	uint32_t idx = 0;
+	while (idx != ArenaChunk::NO_CHUNK) {
+		const auto& ch = m_chunk_slab[idx];
+		if (!ch.free) total += ch.size;
+		idx = ch.next;
+	}
+	return total;
 }
 
 } // namespace riscv
