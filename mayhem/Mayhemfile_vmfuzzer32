@@ -1,0 +1,7 @@
+project: libriscv
+target: vmfuzzer32
+testsuite:
+  - file:///mayhem/mayhem/testsuite/vm
+cmds:
+  - cmd: /mayhem/vmfuzzer32 -handle_fpe=0
+    libfuzzer: true
