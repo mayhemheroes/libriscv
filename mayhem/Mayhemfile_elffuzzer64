@@ -1,0 +1,7 @@
+project: libriscv
+target: elffuzzer64
+testsuite:
+  - file:///mayhem/mayhem/testsuite/elf
+cmds:
+  - cmd: /mayhem/elffuzzer64 -handle_fpe=0
+    libfuzzer: true
