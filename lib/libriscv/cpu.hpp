@@ -190,6 +190,9 @@ namespace riscv
 		// ELF programs linear .text segment (initialized as empty segment)
 		DecodedExecuteSegment<W>* m_exec;
 
+		// Guard against no-progress execute-segment rebuild loops
+		address_t m_stale_restart_pc = ~address_t(0);
+
 		// The current exception (used by eg. TCC which doesn't create unwinding tables)
 		std::exception_ptr m_current_exception = nullptr;
 

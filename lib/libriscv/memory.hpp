@@ -292,7 +292,7 @@ namespace riscv
 		// ELF stuff
 		using Elf = typename riscv::Elf<W>;
 		template <typename T> T* elf_offset(size_t ofs) const {
-			if (ofs + sizeof(T) >= ofs && ofs + sizeof(T) < m_binary.size())
+			if (ofs + sizeof(T) >= ofs && ofs + sizeof(T) <= m_binary.size())
 				return (T*) &m_binary[ofs];
 #if __cpp_exceptions
 			throw MachineException(INVALID_PROGRAM, "Invalid ELF offset", ofs);
@@ -304,7 +304,19 @@ namespace riscv
 		const auto* elf_header() const {
 			return elf_offset<const typename Elf::Header> (0);
 		}
+		// Safely resolve a symbol name from a (section_by_name-validated)
+		// string table. Returns nullptr when st_name points outside the
+		// table or the string is not NUL-terminated within it.
+		const char* elf_symbol_name(const typename Elf::SectionHeader* strtab, uint32_t st_name) const;
 		const typename Elf::SectionHeader* section_by_name(const std::string& name) const;
+		// Like section_by_name, but for callers that index m_binary using the
+		// returned section's sh_offset/sh_size. Returns nullptr (best-effort,
+		// never throws) for a SHT_NOBITS section or one whose file range falls
+		// outside the binary.
+		const typename Elf::SectionHeader* section_by_name_validated(const std::string& name) const;
+		// Validates .symtab/.strtab once and invokes fn(sym, name) for each
+		// symbol; name is nullptr when it points outside the string table.
+		void for_each_symbol(std::function<void(const typename Elf::Sym&, const char*)> fn) const;
 		void dynamic_linking(const typename Elf::Header&);
 		void relocate_section(const char* section_name, const char* symtab);
 		const typename Elf::Sym* resolve_symbol(std::string_view name) const;

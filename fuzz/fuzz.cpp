@@ -211,7 +211,7 @@ static void fuzz_syscall_helpers(const uint8_t* data, size_t len)
 }
 
 extern "C"
-void LLVMFuzzerTestOneInput(const uint8_t* data, size_t len)
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t len)
 {
 #if defined(FUZZ_ELF)
 	fuzz_elf_loader(data, len);
@@ -224,4 +224,5 @@ void LLVMFuzzerTestOneInput(const uint8_t* data, size_t len)
 #else
 	#error "Unknown fuzzing mode"
 #endif
+	return 0;
 }

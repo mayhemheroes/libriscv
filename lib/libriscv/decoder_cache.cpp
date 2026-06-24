@@ -547,6 +547,8 @@ namespace riscv
 #endif
 		// Create the whole executable memory range
 		auto current_exec = std::make_shared<DecodedExecuteSegment<W>>(vaddr, exlen);
+		if (current_exec->empty())
+			throw MachineException(INVALID_PROGRAM, "Empty execute segment");
 
 		auto* exec_data = current_exec->exec_data(vaddr);
 		std::memset(exec_data - sizeof(rv32i_instruction), 0, sizeof(rv32i_instruction));
