@@ -323,27 +323,15 @@ namespace riscv
 				// Validate that the .text section is inside this
 				// execute segment.
 				&& texthdr->sh_addr >= vaddr && texthdr->sh_size <= exlen
-				&& texthdr->sh_addr + texthdr->sh_size <= vaddr + exlen)
+				&& texthdr->sh_addr + texthdr->sh_size <= vaddr + exlen
+				// Validate that the .text section file range is inside
+				// the binary, as sh_offset is used to index m_binary.
+				&& texthdr->sh_offset + texthdr->sh_size >= texthdr->sh_offset
+				&& texthdr->sh_offset + texthdr->sh_size <= m_binary.size())
 			{
 				data = m_binary.data() + texthdr->sh_offset;
 				vaddr = this->elf_base_address(texthdr->sh_addr);
 				exlen = texthdr->sh_size;
-				// Work-around for Zig's __lcxx_override section
-				// It comes right after .text, so we can merge them
-				// TODO: Automatically merge sections that are adjacent
-				const auto *lcxxhdr = section_by_name("__lcxx_override");
-				if (lcxxhdr != nullptr && lcxxhdr->sh_addr == texthdr->sh_addr + texthdr->sh_size)
-				{
-					const unsigned size = texthdr->sh_size + lcxxhdr->sh_size;
-					if (size <= hdr->p_filesz && texthdr->sh_addr + size <= vaddr + hdr->p_filesz)
-					{
-						// Merge the two sections
-						exlen = size;
-					} else if (options.verbose_loader) {
-						printf("* __lcxx_override section is outside of program header: %p -> %p where %zu <= %zu\n",
-							(void*)uintptr_t(vaddr), (void*)uintptr_t(vaddr + exlen), size_t(size), size_t(hdr->p_filesz));
-					}
-				}
 			}
 			//printf("* Found .text section inside segment: %p -> %p\n",
 			//	(void*)uintptr_t(vaddr), (void*)uintptr_t(vaddr + exlen));

@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <cstring>
 #include <libriscv/machine.hpp>
 extern std::vector<uint8_t> load_file(const std::string& filename);
 static const uint64_t MAX_MEMORY = 680ul << 20; /* 680MB */
@@ -223,4 +224,64 @@ TEST_CASE("RV32 Execute-Only Hello World", "[Verify]")
 
 	REQUIRE(machine.return_value() == 123);
 	REQUIRE(state.text == "Hello, World!");
+}
+
+static void set_section_file_offset(std::vector<uint8_t>& elf,
+	const char* section, uint64_t new_offset)
+{
+	auto rd = [&] (auto& out, size_t off) {
+		REQUIRE(off + sizeof(out) <= elf.size());
+		std::memcpy(&out, elf.data() + off, sizeof(out));
+	};
+
+	REQUIRE(elf.size() > 0x34);
+	const bool is64 = elf[4] == 2; // EI_CLASS: 1 = ELF32, 2 = ELF64
+	const size_t sh_offset_field = is64 ? 0x18 : 0x10; // sh_offset within the section header
+
+	uint64_t e_shoff;
+	uint16_t e_shentsize, e_shnum, e_shstrndx;
+	if (is64) {
+		rd(e_shoff, 0x28);
+		rd(e_shentsize, 0x3A); rd(e_shnum, 0x3C); rd(e_shstrndx, 0x3E);
+	} else {
+		uint32_t shoff32; rd(shoff32, 0x20); e_shoff = shoff32;
+		rd(e_shentsize, 0x2E); rd(e_shnum, 0x30); rd(e_shstrndx, 0x32);
+	}
+
+	uint64_t shstrtab_offset;
+	const size_t strtab_hdr = e_shoff + e_shstrndx * e_shentsize;
+	if (is64) {
+		rd(shstrtab_offset, strtab_hdr + sh_offset_field);
+	} else {
+		uint32_t o; rd(o, strtab_hdr + sh_offset_field); shstrtab_offset = o;
+	}
+
+	for (uint16_t i = 0; i < e_shnum; i++) {
+		const size_t hdr_offset = e_shoff + i * e_shentsize;
+		uint32_t sh_name; rd(sh_name, hdr_offset); // sh_name is at +0 in both classes
+		const char* name = (const char*)elf.data() + shstrtab_offset + sh_name;
+		if (std::strcmp(name, section) == 0) {
+			if (is64) {
+				std::memcpy(elf.data() + hdr_offset + sh_offset_field, &new_offset, 8);
+			} else {
+				uint32_t o = (uint32_t)new_offset;
+				std::memcpy(elf.data() + hdr_offset + sh_offset_field, &o, 4);
+			}
+			return;
+		}
+	}
+	FAIL("Section " << section << " not found in test binary");
+}
+
+TEST_CASE("Out-of-range .text section offset", "[Verify]")
+{
+	auto binary = load_file(cwd + "/elf/fib");
+	set_section_file_offset(binary, ".text", 0x70000000ull);
+
+	try {
+		riscv::Machine<RISCV32> machine { binary, { .memory_max = MAX_MEMORY } };
+		(void) machine;
+	} catch (const riscv::MachineException&) {
+		// Gucci
+	}
 }
