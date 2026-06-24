@@ -96,6 +96,8 @@ namespace riscv
 		// Find previously decoded execute segment
 		this->m_exec = machine().memory.exec_segment_for(pc).get();
 		if (LIKELY(!this->m_exec->empty() && !this->m_exec->is_stale())) {
+			// Reached a usable segment, reset the no-progress guard
+			this->m_stale_restart_pc = ~address_t(0);
 			return {this->m_exec, pc};
 		}
 
@@ -146,6 +148,11 @@ restart_next_execute_segment:
 
 		// Evict stale execute segments
 		if (this->m_exec->is_stale()) {
+			// If we already rebuilt for this exact PC and it's stale again,
+			// trap instead of spinning forever
+			if (UNLIKELY(pc == this->m_stale_restart_pc))
+				trigger_exception(EXECUTION_LOOP_DETECTED, pc);
+			this->m_stale_restart_pc = pc;
 			machine().memory.evict_execute_segment(*this->m_exec);
 		}
 
