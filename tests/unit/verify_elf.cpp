@@ -226,8 +226,8 @@ TEST_CASE("RV32 Execute-Only Hello World", "[Verify]")
 	REQUIRE(state.text == "Hello, World!");
 }
 
-static void set_section_file_offset(std::vector<uint8_t>& elf,
-	const char* section, uint64_t new_offset)
+// Returns the file offset of the named section's header within the ELF.
+static size_t section_header_offset(const std::vector<uint8_t>& elf, const char* section)
 {
 	auto rd = [&] (auto& out, size_t off) {
 		REQUIRE(off + sizeof(out) <= elf.size());
@@ -260,17 +260,47 @@ static void set_section_file_offset(std::vector<uint8_t>& elf,
 		const size_t hdr_offset = e_shoff + i * e_shentsize;
 		uint32_t sh_name; rd(sh_name, hdr_offset); // sh_name is at +0 in both classes
 		const char* name = (const char*)elf.data() + shstrtab_offset + sh_name;
-		if (std::strcmp(name, section) == 0) {
-			if (is64) {
-				std::memcpy(elf.data() + hdr_offset + sh_offset_field, &new_offset, 8);
-			} else {
-				uint32_t o = (uint32_t)new_offset;
-				std::memcpy(elf.data() + hdr_offset + sh_offset_field, &o, 4);
-			}
-			return;
-		}
+		if (std::strcmp(name, section) == 0)
+			return hdr_offset;
 	}
 	FAIL("Section " << section << " not found in test binary");
+	return 0;
+}
+
+static void set_section_file_offset(std::vector<uint8_t>& elf,
+	const char* section, uint64_t new_offset)
+{
+	const bool is64 = elf[4] == 2;
+	const size_t sh_offset_field = is64 ? 0x18 : 0x10; // sh_offset within the section header
+	const size_t hdr_offset = section_header_offset(elf, section);
+	if (is64) {
+		std::memcpy(elf.data() + hdr_offset + sh_offset_field, &new_offset, 8);
+	} else {
+		uint32_t o = (uint32_t)new_offset;
+		std::memcpy(elf.data() + hdr_offset + sh_offset_field, &o, 4);
+	}
+}
+
+// sh_type is a uint32_t at +4 in both ELF32 and ELF64 section headers.
+static void set_section_type(std::vector<uint8_t>& elf,
+	const char* section, uint32_t sh_type)
+{
+	const size_t hdr_offset = section_header_offset(elf, section);
+	std::memcpy(elf.data() + hdr_offset + 4, &sh_type, 4);
+}
+
+static void set_section_size(std::vector<uint8_t>& elf,
+	const char* section, uint64_t new_size)
+{
+	const bool is64 = elf[4] == 2;
+	const size_t sh_size_field = is64 ? 0x20 : 0x14; // sh_size within the section header
+	const size_t hdr_offset = section_header_offset(elf, section);
+	if (is64) {
+		std::memcpy(elf.data() + hdr_offset + sh_size_field, &new_size, 8);
+	} else {
+		uint32_t s = (uint32_t)new_size;
+		std::memcpy(elf.data() + hdr_offset + sh_size_field, &s, 4);
+	}
 }
 
 TEST_CASE("Out-of-range .text section offset", "[Verify]")
@@ -283,5 +313,72 @@ TEST_CASE("Out-of-range .text section offset", "[Verify]")
 		(void) machine;
 	} catch (const riscv::MachineException&) {
 		// Gucci
+	}
+}
+
+TEST_CASE("Out-of-range .symtab section offset", "[Verify]")
+{
+	auto binary = load_file(cwd + "/elf/fib");
+	set_section_file_offset(binary, ".symtab", 0x70000000ull);
+
+	// The symbol table is parsed lazily, so loading must succeed, and the
+	// best-effort symbol paths must return empty instead of throwing.
+	riscv::Machine<RISCV32> machine { binary, { .memory_max = MAX_MEMORY } };
+	REQUIRE(machine.address_of("main") == 0);
+	REQUIRE_NOTHROW(machine.memory.all_symbols());
+	REQUIRE_NOTHROW(machine.memory.lookup(0x10074));
+}
+
+TEST_CASE("Out-of-range .strtab section offset", "[Verify]")
+{
+	auto binary = load_file(cwd + "/elf/fib");
+	set_section_file_offset(binary, ".strtab", 0x70000000ull);
+
+	riscv::Machine<RISCV32> machine { binary, { .memory_max = MAX_MEMORY } };
+	REQUIRE(machine.address_of("main") == 0);
+	REQUIRE_NOTHROW(machine.memory.all_symbols());
+	REQUIRE_NOTHROW(machine.memory.lookup(0x10074));
+}
+
+TEST_CASE("SHT_NOBITS .symtab cannot bypass file-range validation", "[Verify]")
+{
+	static constexpr uint32_t SHT_NOBITS = 8;
+	auto binary = load_file(cwd + "/elf/fib");
+	// Point the symbol table out of bounds and disguise it as a section
+	// with no file contents, which must not be file-indexed regardless.
+	set_section_file_offset(binary, ".symtab", 0x70000000ull);
+	set_section_type(binary, ".symtab", SHT_NOBITS);
+
+	riscv::Machine<RISCV32> machine { binary, { .memory_max = MAX_MEMORY } };
+	REQUIRE(machine.address_of("main") == 0);
+	REQUIRE_NOTHROW(machine.memory.all_symbols());
+	REQUIRE_NOTHROW(machine.memory.lookup(0x10074));
+}
+
+TEST_CASE("Symbol section ending exactly at EOF is accepted", "[Verify]")
+{
+	// A section occupying [sh_offset, sh_offset + sh_size) is valid when it
+	// ends exactly at end-of-file; reading the final byte(s) must not throw.
+	SECTION(".strtab ends at EOF") {
+		auto binary = load_file(cwd + "/elf/fib");
+		const uint64_t at_eof = binary.size();
+		binary.push_back(0x00);
+		set_section_file_offset(binary, ".strtab", at_eof);
+		set_section_size(binary, ".strtab", 1);
+
+		riscv::Machine<RISCV32> machine { binary, { .memory_max = MAX_MEMORY } };
+		REQUIRE_NOTHROW(machine.address_of("main"));
+		REQUIRE_NOTHROW(machine.memory.all_symbols());
+	}
+	SECTION(".symtab ends at EOF") {
+		auto binary = load_file(cwd + "/elf/fib");
+		const uint64_t at_eof = binary.size();
+		binary.resize(binary.size() + 16, 0x00); // one zeroed Elf32_Sym
+		set_section_file_offset(binary, ".symtab", at_eof);
+		set_section_size(binary, ".symtab", 16);
+
+		riscv::Machine<RISCV32> machine { binary, { .memory_max = MAX_MEMORY } };
+		REQUIRE_NOTHROW(machine.address_of("main"));
+		REQUIRE_NOTHROW(machine.memory.all_symbols());
 	}
 }

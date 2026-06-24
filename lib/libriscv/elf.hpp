@@ -34,6 +34,11 @@ namespace riscv
 		static constexpr unsigned STB_GLOBAL = 1;
 		static constexpr unsigned STB_WEAK   = 2;
 
+		static constexpr uint32_t SHT_PROGBITS = 1;
+		static constexpr uint32_t SHT_SYMTAB   = 2;
+		static constexpr uint32_t SHT_STRTAB   = 3;
+		static constexpr uint32_t SHT_NOBITS   = 8;
+
 		struct Header {
 			static constexpr unsigned EI_NIDENT = 16;
 			static constexpr unsigned EI_CLASS  = 4;

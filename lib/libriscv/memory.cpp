@@ -318,16 +318,12 @@ namespace riscv
 		if (W <= 8 && !options.ignore_text_section)
 		{
 			// Look for a .text section inside this segment:
-			const auto* texthdr = section_by_name(".text");
+			const auto* texthdr = section_by_name_validated(".text");
 			if (texthdr != nullptr
 				// Validate that the .text section is inside this
 				// execute segment.
 				&& texthdr->sh_addr >= vaddr && texthdr->sh_size <= exlen
-				&& texthdr->sh_addr + texthdr->sh_size <= vaddr + exlen
-				// Validate that the .text section file range is inside
-				// the binary, as sh_offset is used to index m_binary.
-				&& texthdr->sh_offset + texthdr->sh_size >= texthdr->sh_offset
-				&& texthdr->sh_offset + texthdr->sh_size <= m_binary.size())
+				&& texthdr->sh_addr + texthdr->sh_size <= vaddr + exlen)
 			{
 				data = m_binary.data() + texthdr->sh_offset;
 				vaddr = this->elf_base_address(texthdr->sh_addr);
@@ -587,27 +583,16 @@ namespace riscv
 	{
 		if (!Elf::validate(this->m_binary))
 			return {};
-
-		const auto* sym_hdr = section_by_name(".symtab");
-		if (sym_hdr == nullptr) return {};
-		const auto* str_hdr = section_by_name(".strtab");
-		if (str_hdr == nullptr) return {};
 		// backtrace can sometimes find null addresses
 		if (address == 0x0) return {};
-		// ELF with no symbols
-		if (UNLIKELY(sym_hdr->sh_size == 0)) return {};
 
 		// Add the correct offset to address for dynamically loaded programs
 		address = this->elf_base_address(address);
 
-		const auto* symtab = elf_offset<typename Elf::Sym>(sym_hdr->sh_offset);
-		const size_t symtab_ents = sym_hdr->sh_size / sizeof(typename Elf::Sym);
-		const char* strtab = elf_offset<char>(str_hdr->sh_offset);
-
 		const auto result =
-			[] (const char* strtab, address_t addr, const auto* sym)
+			[] (const char* symname, address_t addr, const auto& sym)
 		{
-			const char* symname = &strtab[sym->st_name];
+			if (symname == nullptr) symname = "(invalid)";
 			std::string result;
 #ifdef DEMANGLE_ENABLED
 			if (char* dma = __cxa_demangle(symname, nullptr, nullptr, nullptr); dma != nullptr) {
@@ -621,35 +606,25 @@ namespace riscv
 #endif
 			return Callsite {
 				.name = result,
-				.address = static_cast<address_t>(sym->st_value),
-				.offset = (uint32_t) (addr - sym->st_value),
-				.size   = size_t(sym->st_size)
+				.address = static_cast<address_t>(sym.st_value),
+				.offset = (uint32_t) (addr - sym.st_value),
+				.size   = size_t(sym.st_size)
 			};
 		};
 
 		const typename Elf::Sym* best = nullptr;
-		for (size_t i = 0; i < symtab_ents; i++)
-		{
-			if (Elf::SymbolType(symtab[i].st_info) != Elf::STT_FUNC) continue;
-			/*printf("Testing %#X vs  %#X to %#X = %s\n",
-					address, symtab[i].st_value,
-					symtab[i].st_value + symtab[i].st_size, symname);*/
+		const char* best_name = nullptr;
+		for_each_symbol([&] (const auto& sym, const char* symname) {
+			if (Elf::SymbolType(sym.st_info) != Elf::STT_FUNC) return;
 
-			if (address >= symtab[i].st_value &&
-				address < symtab[i].st_value + symtab[i].st_size)
-			{
-				// The current symbol was the best match
-				return result(strtab, address, &symtab[i]);
-			}
-			else if (address >= symtab[i].st_value && (!best ||
-				symtab[i].st_value > best->st_value))
-			{
+			if (address >= sym.st_value && (!best || sym.st_value > best->st_value)) {
 				// best guess (symbol + 0xOff)
-				best = &symtab[i];
+				best = &sym;
+				best_name = symname;
 			}
-		}
+		});
 		if (best)
-			return result(strtab, address, best);
+			return result(best_name, address, *best);
 		return {};
 	}
 	template <int W>

@@ -1,8 +1,6 @@
 #include "machine.hpp"
 #include "internal_common.hpp"
 
-#include <inttypes.h>
-
 namespace riscv
 {
 	template <int W>
@@ -71,51 +69,75 @@ namespace riscv
 	}
 
 	template <int W>
-	const typename Elf<W>::Sym* Memory<W>::resolve_symbol(std::string_view name) const
+	const typename Elf<W>::SectionHeader* Memory<W>::section_by_name_validated(const std::string& name) const
 	{
-		if (UNLIKELY(m_binary.empty())) return nullptr;
-		const auto* sym_hdr = section_by_name(".symtab");
-		if (UNLIKELY(sym_hdr == nullptr)) return nullptr;
-		const auto* str_hdr = section_by_name(".strtab");
-		if (UNLIKELY(str_hdr == nullptr)) return nullptr;
+		const auto* shdr = section_by_name(name);
+		if (shdr == nullptr)
+			return nullptr;
+		// The caller will file-index this section (sh_offset indexes m_binary,
+		// sh_size bounds the read). A SHT_NOBITS section has no file contents,
+		// so reject it, and reject a file range that escapes the binary.
+		if (shdr->sh_type == Elf::SHT_NOBITS)
+			return nullptr;
+		const auto file_end = shdr->sh_offset + shdr->sh_size;
+		if (file_end < shdr->sh_offset || file_end > m_binary.size())
+			return nullptr;
+		return shdr;
+	}
+
+	template <int W>
+	const char* Memory<W>::elf_symbol_name(const typename Elf::SectionHeader* strtab, uint32_t st_name) const
+	{
+		if (strtab == nullptr)
+			return nullptr;
+		if (st_name >= strtab->sh_size)
+			return nullptr;
+		const char* str = elf_offset<char>(strtab->sh_offset);
+		const size_t maxlen = strtab->sh_size - st_name;
+		if (strnlen(str + st_name, maxlen) >= maxlen)
+			return nullptr;
+		return str + st_name;
+	}
+
+	template <int W>
+	void Memory<W>::for_each_symbol(std::function<void(const typename Elf::Sym&, const char*)> fn) const
+	{
+		if (UNLIKELY(m_binary.empty())) return;
+		const auto* sym_hdr = section_by_name_validated(".symtab");
+		if (UNLIKELY(sym_hdr == nullptr)) return;
+		const auto* str_hdr = section_by_name_validated(".strtab");
+		if (UNLIKELY(str_hdr == nullptr)) return;
 		// ELF with no symbols
-		if (UNLIKELY(sym_hdr->sh_size == 0)) return nullptr;
+		if (UNLIKELY(sym_hdr->sh_size == 0)) return;
 
 		const auto* symtab = elf_sym_index(sym_hdr, 0);
 		const size_t symtab_ents = sym_hdr->sh_size / sizeof(typename Elf::Sym);
-		const char* strtab = elf_offset<char>(str_hdr->sh_offset);
 
 		for (size_t i = 0; i < symtab_ents; i++)
 		{
-			const char* symname = &strtab[symtab[i].st_name];
-			if (name.compare(symname) == 0) {
-				return &symtab[i];
-			}
+			const char* symname = elf_symbol_name(str_hdr, symtab[i].st_name);
+			fn(symtab[i], symname);
 		}
-		return nullptr;
+	}
+
+	template <int W>
+	const typename Elf<W>::Sym* Memory<W>::resolve_symbol(std::string_view name) const
+	{
+		const typename Elf::Sym* result = nullptr;
+		for_each_symbol([&] (const auto& sym, const char* symname) {
+			if (result == nullptr && symname != nullptr && name.compare(symname) == 0)
+				result = &sym;
+		});
+		return result;
 	}
 
 	template <int W>
 	std::vector<const char*> Memory<W>::all_symbols() const
 	{
 		std::vector<const char*> symbols;
-		if (UNLIKELY(m_binary.empty())) return symbols;
-		const auto* sym_hdr = section_by_name(".symtab");
-		const auto* str_hdr = section_by_name(".strtab");
-		if (UNLIKELY(sym_hdr == nullptr || str_hdr == nullptr)) return symbols;
-		// ELF with no symbols
-		if (UNLIKELY(sym_hdr->sh_size == 0)) return symbols;
-
-		const auto* symtab = elf_sym_index(sym_hdr, 0);
-		const size_t symtab_ents = sym_hdr->sh_size / sizeof(typename Elf::Sym);
-		const char* strtab = elf_offset<char>(str_hdr->sh_offset);
-		symbols.reserve(symtab_ents);
-
-		for (size_t i = 0; i < symtab_ents; i++)
-		{
-			const char* symname = &strtab[symtab[i].st_name];
-			symbols.push_back(symname);
-		}
+		for_each_symbol([&] (const auto&, const char* symname) {
+			symbols.push_back(symname != nullptr ? symname : "(invalid)");
+		});
 		return symbols;
 	}
 
@@ -123,22 +145,10 @@ namespace riscv
 	std::vector<std::string_view> Memory<W>::all_unmangled_function_symbols(const std::string& prefix) const
 	{
 		std::vector<std::string_view> symbols;
-		if (UNLIKELY(m_binary.empty())) return symbols;
-		const auto* sym_hdr = section_by_name(".symtab");
-		const auto* str_hdr = section_by_name(".strtab");
-		if (UNLIKELY(sym_hdr == nullptr || str_hdr == nullptr)) return symbols;
-		// ELF with no symbols
-		if (UNLIKELY(sym_hdr->sh_size == 0)) return symbols;
-
-		const auto* symtab = elf_sym_index(sym_hdr, 0);
-		const size_t symtab_ents = sym_hdr->sh_size / sizeof(typename Elf::Sym);
-		const char* strtab = elf_offset<char>(str_hdr->sh_offset);
-		symbols.reserve(symtab_ents);
-
-		for (size_t i = 0; i < symtab_ents; i++)
-		{
-			const char* symname = &strtab[symtab[i].st_name];
-			if (Elf::SymbolType(symtab[i].st_info) == Elf::STT_FUNC && Elf::SymbolBind(symtab[i].st_info) != Elf::STB_WEAK) {
+		for_each_symbol([&] (const auto& sym, const char* symname) {
+			if (symname == nullptr)
+				return;
+			if (Elf::SymbolType(sym.st_info) == Elf::STT_FUNC && Elf::SymbolBind(sym.st_info) != Elf::STB_WEAK) {
 				std::string_view symview(symname);
 				// Detect if the symbol is unmangled (no _Z prefix)
 				if (symview.size() > 2 && !(symview[0] == '_' && symview[1] == 'Z')) {
@@ -146,7 +156,7 @@ namespace riscv
 						symbols.push_back(symview);
 				}
 			}
-		}
+		});
 		return symbols;
 	}
 
@@ -157,7 +167,7 @@ namespace riscv
 		if (UNLIKELY(m_binary.empty())) return comments;
 		const auto* hdr = elf_header();
 		if (UNLIKELY(hdr == nullptr)) return comments;
-		const auto* shdr = section_by_name(".comment");
+		const auto* shdr = section_by_name_validated(".comment");
 		if (UNLIKELY(shdr == nullptr)) return comments;
 		// ELF with no comments
 		if (UNLIKELY(shdr->sh_size == 0)) return comments;
@@ -166,8 +176,6 @@ namespace riscv
 		const char* end = strtab + shdr->sh_size;
 		const char* binary_end = m_binary.data() + m_binary.size(); // MSVC doesn't like m_binary.end()
 
-		if (end < strtab || end > binary_end)
-			throw MachineException(INVALID_PROGRAM, "Invalid ELF comment section");
 		// Check if the comment section is null-terminated at the end
 		if (UNLIKELY(end[-1] != '\0'))
 			throw MachineException(INVALID_PROGRAM, "Invalid ELF comment section");
@@ -186,86 +194,38 @@ namespace riscv
 		return comments;
 	}
 
-	template <int W>
-	static void elf_print_sym(const typename Elf<W>::Sym* sym)
-	{
-		if constexpr (W == 4) {
-			printf("-> Sym is at 0x%" PRIX32 " with size %" PRIu32 ", type %u name %u\n",
-				sym->st_value, sym->st_size,
-				Elf<W>::SymbolType(sym->st_info), sym->st_name);
-		} else {
-			printf("-> Sym is at 0x%" PRIX64 " with size %" PRIu64 ", type %u name %u\n",
-				(uint64_t)sym->st_value, sym->st_size,
-				Elf<W>::SymbolType(sym->st_info), sym->st_name);
-		}
-	}
-
 	template <int W> RISCV_INTERNAL
 	void Memory<W>::relocate_section(const char* section_name, const char* sym_section)
 	{
 		using ElfRela = typename Elf::Rela;
 
-		const auto* rela = section_by_name(section_name);
+		const auto* rela = section_by_name_validated(section_name);
 		if (rela == nullptr) return;
-		const auto* dyn_hdr = section_by_name(sym_section);
+		const auto* dyn_hdr = section_by_name_validated(sym_section);
 		if (dyn_hdr == nullptr) return;
 		const size_t rela_ents = rela->sh_size / sizeof(ElfRela);
-
-		const auto rela_ents_offset = rela->sh_offset + rela_ents * sizeof(ElfRela);
-		if (rela_ents_offset < rela->sh_offset || m_binary.size() < rela_ents_offset)
-			throw MachineException(INVALID_PROGRAM, "Invalid ELF relocations");
 
 		auto* rela_addr = elf_offset<ElfRela>(rela->sh_offset);
 		for (size_t i = 0; i < rela_ents; i++)
 		{
-			size_t symidx;
-			if constexpr (W == 4)
-				symidx = Elf::RelaSym(rela_addr[i].r_info);
-			else
-				symidx = Elf::RelaSym(rela_addr[i].r_info);
+			const size_t symidx = Elf::RelaSym(rela_addr[i].r_info);
 			auto* sym = elf_sym_index(dyn_hdr, symidx);
 
-			const uint8_t type = Elf::SymbolType(sym->st_info);
-			if (true || type == Elf::STT_FUNC || type == Elf::STT_OBJECT)
-			{
-				if constexpr (false)
-				{
-					printf("Relocating rela %zu with sym idx %ld where 0x%lX -> 0x%lX\n",
-							i, (long)symidx, (long)rela_addr[i].r_offset, (long)sym->st_value);
-					elf_print_sym<W>(sym);
-				}
-				const auto rtype = Elf::RelaType(rela_addr[i].r_info);
-				static constexpr int R_RISCV_64 = 0x2;
-				static constexpr int R_RISCV_RELATIVE = 0x3;
-				static constexpr int R_RISCV_JUMPSLOT = 0x5;
-				if (rtype == 0) {
-					// Do nothing
-				}
-				else if (rtype == R_RISCV_64) {
-					this->write<address_t>(elf_base_address(rela_addr[i].r_offset), elf_base_address(sym->st_value));
-				}
-				else if (rtype == R_RISCV_RELATIVE) {
-					this->write<address_t>(elf_base_address(rela_addr[i].r_offset), sym->st_value);
-				}
-				else if (rtype == R_RISCV_JUMPSLOT) {
-					//typedef struct {
-					//	address_t r_offset;
-					//	address_t r_info;
-					//} Elf64_Rel;
-					//printf("Relocating jumpslot %zu with sym idx %ld where 0x%lX -> 0x%lX\n",
-					//		i, (long)symidx, (long)rela_addr[i].r_offset, (long)sym->st_value);
-					//const auto* plt = section_by_name(".plt");
-					//if (plt == nullptr)
-					//	throw MachineException(INVALID_PROGRAM, "Missing .plt section for jumpslot relocation");
-					//const auto* plt_addr = elf_offset<Elf64_Rel>(plt->sh_offset);
-					//const Elf64_Rel& plt_entry = plt_addr[sym->st_value / sizeof(Elf64_Rel)];
-					//const auto plt_address = elf_base_address(plt_entry.r_offset);
-					// Write the PLT address to the jumpslot
-					//this->write<address_t>(elf_base_address(rela_addr[i].r_offset), plt_address);
-				}
-				else {
-					throw MachineException(INVALID_PROGRAM, "Unknown relocation type", rtype);
-				}
+			const auto rtype = Elf::RelaType(rela_addr[i].r_info);
+			static constexpr int R_RISCV_64 = 0x2;
+			static constexpr int R_RISCV_RELATIVE = 0x3;
+			static constexpr int R_RISCV_JUMPSLOT = 0x5;
+			if (rtype == 0 || rtype == R_RISCV_JUMPSLOT) {
+				// Do nothing
+			}
+			else if (rtype == R_RISCV_64) {
+				this->write<address_t>(elf_base_address(rela_addr[i].r_offset), elf_base_address(sym->st_value));
+			}
+			else if (rtype == R_RISCV_RELATIVE) {
+				this->write<address_t>(elf_base_address(rela_addr[i].r_offset), sym->st_value);
+			}
+			else {
+				throw MachineException(INVALID_PROGRAM, "Unknown relocation type", rtype);
 			}
 		}
 	}
